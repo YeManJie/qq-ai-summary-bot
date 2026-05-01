@@ -300,7 +300,7 @@ CLUSTER_SUMMARY_SYSTEM_PROMPT = """
 你是一个群聊单对话簇总结助手。
 
 你的任务是：
-只针对一个 cluster 生成详细总结。
+只针对一个已经明确给出的对话簇生成详细总结。
 
 你只做总结，不做切片，不做降噪，不做聚合，不做分类，不做标签。
 
@@ -309,46 +309,44 @@ CLUSTER_SUMMARY_SYSTEM_PROMPT = """
 2. key_points 提取 3 到 5 条，每条尽量短，突出核心信息、关键观点、重要转折或主要结论。
 3. 如果讨论整体偏轻松闲聊，也要如实概括，不要硬拔高。
 4. 不要逐条复读聊天记录，不要写成流水账。
-5. 输出必须是 JSON，不要输出任何额外解释文字。
+5. 你应以传入的 cluster 消息集合为准，不要试图推断其他 cluster 的内容。
+6. 输出必须是 JSON，不要输出任何额外解释文字。
 """.strip()
 
 
 def build_cluster_summary_user_prompt(
-    messages_for_ai: list[dict],
-    cluster: dict,
+    cluster_messages: list[dict],
+    cluster_reason: str | None,
     classification_result: dict | None,
     tag_result: dict | None
 ) -> str:
-    messages_json = json.dumps(messages_for_ai, ensure_ascii=False, indent=2)
-    cluster_json = json.dumps(cluster, ensure_ascii=False, indent=2)
+    messages_json = json.dumps(cluster_messages, ensure_ascii=False, indent=2)
     classification_json = json.dumps(classification_result, ensure_ascii=False, indent=2)
     tag_json = json.dumps(tag_result, ensure_ascii=False, indent=2)
 
     return f"""
-下面是一组群聊消息，以及其中一个对话簇、该簇的分类结果和标签结果。
+下面是一组已经明确属于同一个对话簇的群聊消息，以及该簇已有的说明、分类结果和标签结果。
 
-请只对这个 cluster 生成详细总结。
+请只对这一个 cluster 生成详细总结。
 
 输出格式必须严格为：
 {{
-  "cluster_id": "cluster_001",
   "summary": "这里是一段详细总结",
   "key_points": ["要点1", "要点2", "要点3"],
   "reason": "一句简短理由"
 }}
 
 注意：
-- cluster_id 必须与输入 cluster 一致
 - summary 用 2 到 5 句
 - key_points 必须是 3 到 5 条
 - reason 要简短
 - 只能输出 JSON
 
-原始消息如下：
+该 cluster 的消息如下：
 {messages_json}
 
-目标 cluster 如下：
-{cluster_json}
+该 cluster 的已有说明如下：
+{json.dumps(cluster_reason, ensure_ascii=False)}
 
 该 cluster 的分类结果如下：
 {classification_json}

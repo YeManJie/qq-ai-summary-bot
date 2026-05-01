@@ -34,11 +34,32 @@ class ProcessPipelineRequest(BaseModel):
     end_time: str
 
 
+class ClusterPayload(BaseModel):
+    message_ids: list[str]
+    reason: str | None = None
+    slice_ids: list[str] | None = None
+    cluster_id: str | None = None
+
+
+class ClassificationPayload(BaseModel):
+    category: str | None = None
+    reason: str | None = None
+    cluster_id: str | None = None
+
+
+class TagPayload(BaseModel):
+    tags: list[str] | None = None
+    reason: str | None = None
+    cluster_id: str | None = None
+
+
 class ClusterSummaryRequest(BaseModel):
     group_id: str
     start_time: str
     end_time: str
-    cluster_id: str
+    cluster: ClusterPayload
+    classification: ClassificationPayload | None = None
+    tag: TagPayload | None = None
 
 
 def normalize_url(url: str | None) -> str | None:
@@ -456,7 +477,6 @@ def build_messages_for_ai(messages: list[Message]) -> list[dict]:
 def run_pipeline_steps(messages_for_ai: list[dict]) -> dict:
     client = LLMClient()
 
-    # 1. slice
     slice_user_prompt = build_slice_user_prompt(messages_for_ai)
     slice_result = client.chat(
         system_prompt=SLICE_SYSTEM_PROMPT,
@@ -466,7 +486,6 @@ def run_pipeline_steps(messages_for_ai: list[dict]) -> dict:
     parsed_slice_json = slice_result.get("parsed_json")
     slices = parsed_slice_json.get("slices", []) if isinstance(parsed_slice_json, dict) else []
 
-    # 2. denoise
     denoise_result = None
     slice_noise_results = []
     if slices:
@@ -480,7 +499,6 @@ def run_pipeline_steps(messages_for_ai: list[dict]) -> dict:
         if isinstance(parsed_denoise_json, dict):
             slice_noise_results = parsed_denoise_json.get("slice_noise_results", [])
 
-    # 3. cluster
     cluster_result = None
     clusters = []
     if slices and slice_noise_results:
@@ -498,7 +516,6 @@ def run_pipeline_steps(messages_for_ai: list[dict]) -> dict:
         if isinstance(parsed_cluster_json, dict):
             clusters = parsed_cluster_json.get("clusters", [])
 
-    # 4. classify
     classification_result = None
     classification_results = []
     if clusters:
@@ -515,7 +532,6 @@ def run_pipeline_steps(messages_for_ai: list[dict]) -> dict:
         if isinstance(parsed_classification_json, dict):
             classification_results = parsed_classification_json.get("cluster_classification_results", [])
 
-    # 5. tag
     tag_result = None
     tag_results = []
     if clusters and classification_results:
@@ -801,34 +817,30 @@ def process_cluster_summary(request: ClusterSummaryRequest):
                 "error": "当前时间窗口内没有消息"
             }
 
-        step_results = run_pipeline_steps(messages_for_ai)
-
-        clusters = step_results["clusters"]
-        classification_results = step_results["classification_results"]
-        tag_results = step_results["tag_results"]
-
-        target_cluster = next((c for c in clusters if c.get("cluster_id") == request.cluster_id), None)
-        if not target_cluster:
+        wanted_ids = set(request.cluster.message_ids)
+        if not wanted_ids:
             return {
                 "ok": False,
-                "error": f"未找到 cluster_id={request.cluster_id}"
+                "error": "cluster.message_ids 不能为空"
             }
 
-        target_classification = next(
-            (x for x in classification_results if x.get("cluster_id") == request.cluster_id),
-            None
-        )
-        target_tag = next(
-            (x for x in tag_results if x.get("cluster_id") == request.cluster_id),
-            None
-        )
+        cluster_messages = [
+            msg for msg in messages_for_ai
+            if msg.get("message_id") in wanted_ids
+        ]
+
+        if not cluster_messages:
+            return {
+                "ok": False,
+                "error": "未能根据 message_ids 匹配到任何消息"
+            }
 
         client = LLMClient()
         summary_user_prompt = build_cluster_summary_user_prompt(
-            messages_for_ai=messages_for_ai,
-            cluster=target_cluster,
-            classification_result=target_classification,
-            tag_result=target_tag,
+            cluster_messages=cluster_messages,
+            cluster_reason=request.cluster.reason,
+            classification_result=request.classification.model_dump() if request.classification else None,
+            tag_result=request.tag.model_dump() if request.tag else None,
         )
 
         summary_result = client.chat(
@@ -842,10 +854,11 @@ def process_cluster_summary(request: ClusterSummaryRequest):
             "group_id": request.group_id,
             "start_time": request.start_time,
             "end_time": request.end_time,
-            "cluster_id": request.cluster_id,
-            "cluster": target_cluster,
-            "classification": target_classification,
-            "tag": target_tag,
+            "cluster": request.cluster.model_dump(),
+            "classification": request.classification.model_dump() if request.classification else None,
+            "tag": request.tag.model_dump() if request.tag else None,
+            "matched_message_count": len(cluster_messages),
+            "cluster_messages": cluster_messages,
             "summary_result": summary_result,
         }
 
