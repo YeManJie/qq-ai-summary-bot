@@ -17,6 +17,10 @@ from app.ai.prompts import (
     build_cluster_user_prompt,
     CLASSIFY_SYSTEM_PROMPT,
     build_classify_user_prompt,
+    TAG_SYSTEM_PROMPT,
+    build_tag_user_prompt,
+    CLUSTER_SUMMARY_SYSTEM_PROMPT,
+    build_cluster_summary_user_prompt,
 )
 
 app = FastAPI()
@@ -30,15 +34,20 @@ class ProcessPipelineRequest(BaseModel):
     end_time: str
 
 
+class ClusterSummaryRequest(BaseModel):
+    group_id: str
+    start_time: str
+    end_time: str
+    cluster_id: str
+
+
 def normalize_url(url: str | None) -> str | None:
-    """统一规范化 URL，把 HTML 转义字符还原。"""
     if not url:
         return None
     return html.unescape(str(url)).strip()
 
 
 def clean_message(raw_message: str) -> str:
-    """去掉 CQ 码，只保留可读文本。"""
     if not raw_message:
         return ""
 
@@ -47,7 +56,6 @@ def clean_message(raw_message: str) -> str:
 
 
 def extract_reply_target(raw_message: str) -> str | None:
-    """提取回复目标消息 ID。"""
     if not raw_message:
         return None
 
@@ -58,7 +66,6 @@ def extract_reply_target(raw_message: str) -> str | None:
 
 
 def extract_mentioned_users(raw_message: str) -> list[str]:
-    """提取被 @ 的用户列表。"""
     if not raw_message:
         return []
 
@@ -66,10 +73,6 @@ def extract_mentioned_users(raw_message: str) -> list[str]:
 
 
 def detect_message_features(raw_message: str, resource_info: dict) -> dict:
-    """
-    根据 raw_message 和资源信息，生成消息描述字段。
-    优先把 animation 判成 animation，不让它轻易落入 mixed。
-    """
     is_reply = "[CQ:reply" in (raw_message or "")
     reply_target_id = extract_reply_target(raw_message)
 
@@ -117,9 +120,6 @@ def detect_message_features(raw_message: str, resource_info: dict) -> dict:
 
 
 def extract_resources_from_segments(message_segments: list) -> dict:
-    """
-    优先从 NapCat 的结构化 message 段里提取资源。
-    """
     image_urls: list[str] = []
     image_files: list[str] = []
     image_sizes: list[str] = []
@@ -224,9 +224,6 @@ def extract_resources_from_segments(message_segments: list) -> dict:
 
 
 def extract_resources_from_raw_message(raw_message: str) -> dict:
-    """
-    从 raw_message 里兜底提取资源。
-    """
     image_urls: list[str] = []
     image_files: list[str] = []
     image_sizes: list[str] = []
@@ -359,9 +356,6 @@ def extract_resources_from_raw_message(raw_message: str) -> dict:
 
 
 def dedupe_resource_objects(resources: list[dict]) -> list[dict]:
-    """
-    对 resource_json 做对象级去重。
-    """
     deduped = []
     seen = set()
 
@@ -395,9 +389,6 @@ def dedupe_resource_objects(resources: list[dict]) -> list[dict]:
 
 
 def merge_resource_info(segment_info: dict, raw_info: dict) -> dict:
-    """
-    合并结构化 message 段提取结果和 raw_message 兜底提取结果。
-    """
     def unique_list(values):
         result = []
         for v in values:
@@ -427,6 +418,132 @@ def merge_resource_info(segment_info: dict, raw_info: dict) -> dict:
         "animation_files": unique_list(segment_info["animation_files"] + raw_info["animation_files"]),
         "animation_urls": unique_list(segment_info["animation_urls"] + raw_info["animation_urls"]),
         "resources": merged_resources,
+    }
+
+
+def build_messages_for_ai(messages: list[Message]) -> list[dict]:
+    messages_for_ai = []
+    for message in messages:
+        messages_for_ai.append({
+            "message_id": message.message_id,
+            "time": message.received_at,
+            "user_id": message.user_id,
+            "cleaned_message": message.cleaned_message or "",
+            "message_type": message.message_type,
+            "sub_type": message.sub_type,
+            "is_reply": message.is_reply,
+            "reply_target_id": message.reply_target_id,
+            "has_at": message.has_at,
+            "mentioned_users": json.loads(message.mentioned_users) if message.mentioned_users else [],
+            "has_file": message.has_file,
+            "has_image": message.has_image,
+            "has_face": message.has_face,
+            "has_animation": message.has_animation,
+            "image_urls": json.loads(message.image_urls) if message.image_urls else [],
+            "image_files": json.loads(message.image_files) if message.image_files else [],
+            "image_sizes": json.loads(message.image_sizes) if message.image_sizes else [],
+            "file_urls": json.loads(message.file_urls) if message.file_urls else [],
+            "file_names": json.loads(message.file_names) if message.file_names else [],
+            "file_sizes": json.loads(message.file_sizes) if message.file_sizes else [],
+            "face_ids": json.loads(message.face_ids) if message.face_ids else [],
+            "animation_files": json.loads(message.animation_files) if message.animation_files else [],
+            "animation_urls": json.loads(message.animation_urls) if message.animation_urls else [],
+            "resource_json": json.loads(message.resource_json) if message.resource_json else [],
+        })
+    return messages_for_ai
+
+
+def run_pipeline_steps(messages_for_ai: list[dict]) -> dict:
+    client = LLMClient()
+
+    # 1. slice
+    slice_user_prompt = build_slice_user_prompt(messages_for_ai)
+    slice_result = client.chat(
+        system_prompt=SLICE_SYSTEM_PROMPT,
+        user_prompt=slice_user_prompt,
+        temperature=0.2
+    )
+    parsed_slice_json = slice_result.get("parsed_json")
+    slices = parsed_slice_json.get("slices", []) if isinstance(parsed_slice_json, dict) else []
+
+    # 2. denoise
+    denoise_result = None
+    slice_noise_results = []
+    if slices:
+        denoise_user_prompt = build_denoise_user_prompt(messages_for_ai, slices)
+        denoise_result = client.chat(
+            system_prompt=DENOISE_SYSTEM_PROMPT,
+            user_prompt=denoise_user_prompt,
+            temperature=0.2
+        )
+        parsed_denoise_json = denoise_result.get("parsed_json")
+        if isinstance(parsed_denoise_json, dict):
+            slice_noise_results = parsed_denoise_json.get("slice_noise_results", [])
+
+    # 3. cluster
+    cluster_result = None
+    clusters = []
+    if slices and slice_noise_results:
+        cluster_user_prompt = build_cluster_user_prompt(
+            messages_for_ai=messages_for_ai,
+            slices=slices,
+            slice_noise_results=slice_noise_results
+        )
+        cluster_result = client.chat(
+            system_prompt=CLUSTER_SYSTEM_PROMPT,
+            user_prompt=cluster_user_prompt,
+            temperature=0.2
+        )
+        parsed_cluster_json = cluster_result.get("parsed_json")
+        if isinstance(parsed_cluster_json, dict):
+            clusters = parsed_cluster_json.get("clusters", [])
+
+    # 4. classify
+    classification_result = None
+    classification_results = []
+    if clusters:
+        classify_user_prompt = build_classify_user_prompt(
+            messages_for_ai=messages_for_ai,
+            clusters=clusters
+        )
+        classification_result = client.chat(
+            system_prompt=CLASSIFY_SYSTEM_PROMPT,
+            user_prompt=classify_user_prompt,
+            temperature=0.2
+        )
+        parsed_classification_json = classification_result.get("parsed_json")
+        if isinstance(parsed_classification_json, dict):
+            classification_results = parsed_classification_json.get("cluster_classification_results", [])
+
+    # 5. tag
+    tag_result = None
+    tag_results = []
+    if clusters and classification_results:
+        tag_user_prompt = build_tag_user_prompt(
+            messages_for_ai=messages_for_ai,
+            clusters=clusters,
+            classification_results=classification_results
+        )
+        tag_result = client.chat(
+            system_prompt=TAG_SYSTEM_PROMPT,
+            user_prompt=tag_user_prompt,
+            temperature=0.2
+        )
+        parsed_tag_json = tag_result.get("parsed_json")
+        if isinstance(parsed_tag_json, dict):
+            tag_results = parsed_tag_json.get("cluster_tag_results", [])
+
+    return {
+        "slice_result": slice_result,
+        "denoise_result": denoise_result,
+        "cluster_result": cluster_result,
+        "classification_result": classification_result,
+        "tag_result": tag_result,
+        "slices": slices,
+        "slice_noise_results": slice_noise_results,
+        "clusters": clusters,
+        "classification_results": classification_results,
+        "tag_results": tag_results,
     }
 
 
@@ -605,14 +722,6 @@ def get_messages(
 
 @app.post("/process/pipeline")
 def process_pipeline(request: ProcessPipelineRequest):
-    """
-    第二阶段最小原型：
-    1. 按 group_id + 时间窗口取消息
-    2. 调用 LLM 做 AI 切片
-    3. 调用 LLM 做切片级降噪
-    4. 调用 LLM 做聚合，得到对话簇
-    5. 调用 LLM 做对话簇分类
-    """
     db = SessionLocal()
 
     try:
@@ -625,38 +734,7 @@ def process_pipeline(request: ProcessPipelineRequest):
             .all()
         )
 
-        print("step 1: query messages ok, count =", len(messages))
-
-        messages_for_ai = []
-        for message in messages:
-            messages_for_ai.append({
-                "message_id": message.message_id,
-                "time": message.received_at,
-                "user_id": message.user_id,
-                "cleaned_message": message.cleaned_message or "",
-                "message_type": message.message_type,
-                "sub_type": message.sub_type,
-                "is_reply": message.is_reply,
-                "reply_target_id": message.reply_target_id,
-                "has_at": message.has_at,
-                "mentioned_users": json.loads(message.mentioned_users) if message.mentioned_users else [],
-                "has_file": message.has_file,
-                "has_image": message.has_image,
-                "has_face": message.has_face,
-                "has_animation": message.has_animation,
-                "image_urls": json.loads(message.image_urls) if message.image_urls else [],
-                "image_files": json.loads(message.image_files) if message.image_files else [],
-                "image_sizes": json.loads(message.image_sizes) if message.image_sizes else [],
-                "file_urls": json.loads(message.file_urls) if message.file_urls else [],
-                "file_names": json.loads(message.file_names) if message.file_names else [],
-                "file_sizes": json.loads(message.file_sizes) if message.file_sizes else [],
-                "face_ids": json.loads(message.face_ids) if message.face_ids else [],
-                "animation_files": json.loads(message.animation_files) if message.animation_files else [],
-                "animation_urls": json.loads(message.animation_urls) if message.animation_urls else [],
-                "resource_json": json.loads(message.resource_json) if message.resource_json else [],
-            })
-
-        print("step 2: messages_for_ai built")
+        messages_for_ai = build_messages_for_ai(messages)
 
         if not messages_for_ai:
             return {
@@ -670,91 +748,10 @@ def process_pipeline(request: ProcessPipelineRequest):
                 "denoise_result": None,
                 "cluster_result": None,
                 "classification_result": None,
+                "tag_result": None,
             }
 
-        client = LLMClient()
-        print("step 3: client created")
-
-        # 第一步：AI 切片
-        slice_user_prompt = build_slice_user_prompt(messages_for_ai)
-        print("step 4: slice prompt built, length =", len(slice_user_prompt))
-
-        slice_result = client.chat(
-            system_prompt=SLICE_SYSTEM_PROMPT,
-            user_prompt=slice_user_prompt,
-            temperature=0.2
-        )
-        print("step 5: slice done")
-
-        parsed_slice_json = slice_result.get("parsed_json")
-        slices = []
-
-        if isinstance(parsed_slice_json, dict):
-            slices = parsed_slice_json.get("slices", [])
-
-        print("step 6: slices parsed, count =", len(slices))
-
-        # 第二步：切片级 AI 降噪
-        denoise_result = None
-        slice_noise_results = []
-
-        if slices:
-            denoise_user_prompt = build_denoise_user_prompt(messages_for_ai, slices)
-            print("step 7: denoise prompt built, length =", len(denoise_user_prompt))
-
-            denoise_result = client.chat(
-                system_prompt=DENOISE_SYSTEM_PROMPT,
-                user_prompt=denoise_user_prompt,
-                temperature=0.2
-            )
-            print("step 8: denoise done")
-
-            parsed_denoise_json = denoise_result.get("parsed_json")
-            if isinstance(parsed_denoise_json, dict):
-                slice_noise_results = parsed_denoise_json.get("slice_noise_results", [])
-
-        print("step 9: slice_noise_results count =", len(slice_noise_results))
-
-        # 第三步：AI 聚合
-        cluster_result = None
-        clusters = []
-
-        if slices and slice_noise_results:
-            cluster_user_prompt = build_cluster_user_prompt(
-                messages_for_ai=messages_for_ai,
-                slices=slices,
-                slice_noise_results=slice_noise_results
-            )
-            print("step 10: cluster prompt built, length =", len(cluster_user_prompt))
-
-            cluster_result = client.chat(
-                system_prompt=CLUSTER_SYSTEM_PROMPT,
-                user_prompt=cluster_user_prompt,
-                temperature=0.2
-            )
-            print("step 11: cluster done")
-
-            parsed_cluster_json = cluster_result.get("parsed_json")
-            if isinstance(parsed_cluster_json, dict):
-                clusters = parsed_cluster_json.get("clusters", [])
-
-        print("step 12: clusters count =", len(clusters))
-
-        # 第四步：AI 分类
-        classification_result = None
-        if clusters:
-            classify_user_prompt = build_classify_user_prompt(
-                messages_for_ai=messages_for_ai,
-                clusters=clusters
-            )
-            print("step 13: classify prompt built, length =", len(classify_user_prompt))
-
-            classification_result = client.chat(
-                system_prompt=CLASSIFY_SYSTEM_PROMPT,
-                user_prompt=classify_user_prompt,
-                temperature=0.2
-            )
-            print("step 14: classify done")
+        step_results = run_pipeline_steps(messages_for_ai)
 
         return {
             "ok": True,
@@ -763,10 +760,93 @@ def process_pipeline(request: ProcessPipelineRequest):
             "end_time": request.end_time,
             "count": len(messages_for_ai),
             "messages_for_ai": messages_for_ai,
-            "slice_result": slice_result,
-            "denoise_result": denoise_result,
-            "cluster_result": cluster_result,
-            "classification_result": classification_result,
+            "slice_result": step_results["slice_result"],
+            "denoise_result": step_results["denoise_result"],
+            "cluster_result": step_results["cluster_result"],
+            "classification_result": step_results["classification_result"],
+            "tag_result": step_results["tag_result"],
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/process/cluster-summary")
+def process_cluster_summary(request: ClusterSummaryRequest):
+    db = SessionLocal()
+
+    try:
+        messages = (
+            db.query(Message)
+            .filter(Message.group_id == request.group_id)
+            .filter(Message.received_at >= request.start_time)
+            .filter(Message.received_at <= request.end_time)
+            .order_by(Message.received_at.asc())
+            .all()
+        )
+
+        messages_for_ai = build_messages_for_ai(messages)
+
+        if not messages_for_ai:
+            return {
+                "ok": False,
+                "error": "当前时间窗口内没有消息"
+            }
+
+        step_results = run_pipeline_steps(messages_for_ai)
+
+        clusters = step_results["clusters"]
+        classification_results = step_results["classification_results"]
+        tag_results = step_results["tag_results"]
+
+        target_cluster = next((c for c in clusters if c.get("cluster_id") == request.cluster_id), None)
+        if not target_cluster:
+            return {
+                "ok": False,
+                "error": f"未找到 cluster_id={request.cluster_id}"
+            }
+
+        target_classification = next(
+            (x for x in classification_results if x.get("cluster_id") == request.cluster_id),
+            None
+        )
+        target_tag = next(
+            (x for x in tag_results if x.get("cluster_id") == request.cluster_id),
+            None
+        )
+
+        client = LLMClient()
+        summary_user_prompt = build_cluster_summary_user_prompt(
+            messages_for_ai=messages_for_ai,
+            cluster=target_cluster,
+            classification_result=target_classification,
+            tag_result=target_tag,
+        )
+
+        summary_result = client.chat(
+            system_prompt=CLUSTER_SUMMARY_SYSTEM_PROMPT,
+            user_prompt=summary_user_prompt,
+            temperature=0.2
+        )
+
+        return {
+            "ok": True,
+            "group_id": request.group_id,
+            "start_time": request.start_time,
+            "end_time": request.end_time,
+            "cluster_id": request.cluster_id,
+            "cluster": target_cluster,
+            "classification": target_classification,
+            "tag": target_tag,
+            "summary_result": summary_result,
         }
 
     except Exception as e:
