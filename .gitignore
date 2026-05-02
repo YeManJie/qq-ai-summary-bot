@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.env
+.env.*
+!.env.example
+
+*.db
+messages.db
+backend/messages.db
