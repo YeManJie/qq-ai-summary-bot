@@ -183,4 +183,4 @@ npm run dev
 
 ## License
 
-暂未设置。
+MIT
